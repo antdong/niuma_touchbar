@@ -10,3 +10,7 @@ build/
 # 远程审批配置（含 token，绝不入库；实际在 ~/.niumabar/，这里再保险一道）
 telegram.conf
 *.conf.off
+
+# 备份文件
+*.bak
+*.bak-niumabar-*

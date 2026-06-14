@@ -96,6 +96,7 @@ Control Strip 常驻槽位的宽度被系统**死钳在约 55pt**（实测：`in
 agent 任务**失败**（❌）或**收尾完成回到空闲**（✅）时，额外推一条纯通知到 Telegram。`telegram.conf` 里 `NOTIFY_FAILED=0` / `NOTIFY_DONE=0` 可分别关闭。
 
 ### 行为 & 安全
+- **总开关 `APPROVE_ENABLED`**（默认 1）：设 `0` 则完全不走远程审批、立即回落本地终端审批，失败/完成通知（`NOTIFY_*`）不受影响——「只要通知不要审批」就这么配
 - 只对 `APPROVE_TOOLS`（默认 Bash/Edit/Write/MultiEdit/NotebookEdit）走远程审批，其余工具不拦
 - **超时（默认 250s）或不可达 → 回落本地终端审批；绝不自动放行、绝不误阻断**（未配 token 时 hook 秒退）
 - 消息里显示**具体命令**；`telegram.conf` 权限 600

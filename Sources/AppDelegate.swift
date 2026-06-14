@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTouc
     var iconMenuItems: [NSMenuItem] = []
     var previewMenuItem: NSMenuItem!
     var loginMenuItem: NSMenuItem!
+    var approveMenuItem: NSMenuItem!
 
     var fullBarActive: Bool { fullPet?.window != nil }
     private var sigSrc: DispatchSourceSignal?
@@ -386,6 +387,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTouc
         loginMenuItem.target = self
         menu.addItem(loginMenuItem)
 
+        // 远程审批开关：写 ~/.niumabar/telegram.conf 的 APPROVE_ENABLED，hook 下次调用即生效
+        approveMenuItem = NSMenuItem(title: "远程审批（Telegram）", action: #selector(toggleApprove), keyEquivalent: "")
+        approveMenuItem.target = self
+        menu.addItem(approveMenuItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出小牛马", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
@@ -425,6 +431,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTouc
             loginMenuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         } else {
             loginMenuItem.isHidden = true
+        }
+        if approvalConfigured() {
+            approveMenuItem.isEnabled = true
+            approveMenuItem.title = "远程审批（Telegram）"
+            approveMenuItem.state = approvalEnabled() ? .on : .off
+            approveMenuItem.toolTip = "勾选 = 敏感命令需手机点「批准」放行；取消 = 只发通知、命令在本地终端审批"
+        } else {
+            approveMenuItem.isEnabled = false
+            approveMenuItem.title = "远程审批（未配置 Telegram）"
+            approveMenuItem.state = .off
+            approveMenuItem.toolTip = "先在 ~/.niumabar/telegram.conf 配好 TG_TOKEN / TG_CHAT"
         }
     }
 
@@ -503,6 +520,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTouc
             let alert = NSAlert()
             alert.messageText = "设置开机自启失败"
             alert.informativeText = "\(error.localizedDescription)\n\n建议把 NiuMaBar.app 移到 /Applications 后再试。"
+            alert.runModal()
+        }
+    }
+
+    @objc private func toggleApprove() {
+        guard approvalConfigured() else { return }
+        setApprovalEnabled(!approvalEnabled())
+    }
+
+    // MARK: - 远程审批开关（读写 ~/.niumabar/telegram.conf）
+
+    private var telegramConfURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".niumabar/telegram.conf")
+    }
+
+    /// 读取 conf 里某个 KEY=value（去掉引号/首尾空白）；找不到返回 nil。忽略注释行。
+    private func confValue(_ key: String) -> String? {
+        guard let text = try? String(contentsOf: telegramConfURL, encoding: .utf8) else { return nil }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("#"), line.hasPrefix(key + "=") else { continue }
+            var v = String(line.dropFirst(key.count + 1)).trimmingCharacters(in: .whitespaces)
+            if v.count >= 2, (v.hasPrefix("\"") && v.hasSuffix("\"")) || (v.hasPrefix("'") && v.hasSuffix("'")) {
+                v = String(v.dropFirst().dropLast())
+            }
+            return v
+        }
+        return nil
+    }
+
+    /// Telegram 是否配好（有 token + chat），没配则审批本就不生效，开关置灰。
+    private func approvalConfigured() -> Bool {
+        !(confValue("TG_TOKEN") ?? "").isEmpty && !(confValue("TG_CHAT") ?? "").isEmpty
+    }
+
+    /// 缺省（无该行）按 shell 的 ${APPROVE_ENABLED:-1} 视为开启。
+    private func approvalEnabled() -> Bool {
+        (confValue("APPROVE_ENABLED") ?? "1") != "0"
+    }
+
+    private func setApprovalEnabled(_ on: Bool) {
+        let url = telegramConfURL
+        let val = on ? "1" : "0"
+        var lines = (try? String(contentsOf: url, encoding: .utf8))?
+            .components(separatedBy: "\n") ?? []
+        var replaced = false
+        for i in lines.indices {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            if !t.hasPrefix("#"), t.hasPrefix("APPROVE_ENABLED=") {
+                lines[i] = "APPROVE_ENABLED=\(val)"
+                replaced = true
+                break
+            }
+        }
+        if !replaced {
+            if lines.last?.isEmpty == false { lines.append("") }
+            lines.append("# 远程审批总开关（小牛马菜单写入）：1=开启，0=关闭")
+            lines.append("APPROVE_ENABLED=\(val)")
+        }
+        do {
+            try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            // 原子写入会换 inode、丢权限，恢复 600（含 token，不能让别的用户读）
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "无法写入 telegram.conf"
+            alert.informativeText = "\(error.localizedDescription)\n\n路径：\(url.path)"
             alert.runModal()
         }
     }

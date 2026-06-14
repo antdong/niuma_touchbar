@@ -8,6 +8,10 @@ TG_TOKEN=""
 #    把显示的 chat_id 填这里
 TG_CHAT=""
 
+# 远程审批总开关：1=开启（默认），0=关闭——不拦命令、只走本地审批，
+# 但失败/完成通知（下面 NOTIFY_*）照常推送。「只要通知不要审批」就设 0。
+APPROVE_ENABLED=1
+
 # 哪些工具触发远程审批（空格分隔）。默认只对会改动系统的敏感工具。
 APPROVE_TOOLS="Bash Edit Write MultiEdit NotebookEdit"
 

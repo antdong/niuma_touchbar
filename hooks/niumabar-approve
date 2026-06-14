@@ -8,6 +8,10 @@
 CONF="$HOME/.niumabar/telegram.conf"
 [ -r "$CONF" ] && . "$CONF" 2>/dev/null
 
+# 远程审批总开关：APPROVE_ENABLED=0 → 完全不介入、立即回落本地终端审批
+# （失败/完成通知由 niumabar-hook 的 NOTIFY_* 控制，不受此开关影响）
+[ "${APPROVE_ENABLED:-1}" = "0" ] && exit 0
+
 JQ="$(command -v jq || echo /usr/bin/jq)"
 IN="$(cat 2>/dev/null)"
 TOOL="$(printf '%s' "$IN" | "$JQ" -r '.tool_name // ""' 2>/dev/null)"

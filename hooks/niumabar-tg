@@ -13,9 +13,52 @@ need_token() { [ -n "$TG_TOKEN" ] || { echo "× 先在 $CONF 填 TG_TOKEN（@Bot
 case "${1:-}" in
   chatid)
     need_token
-    echo "最近给该 bot 发过消息的会话："
-    curl -s "$API/getUpdates" | "$JQ" -r '.result[]?.message.chat | "  chat_id=\(.id)   \(.first_name // .title // "?")"' | sort -u
-    echo "→ 先在 Telegram 给你的 bot 发任意一条消息，再跑本命令；把 chat_id 填进 $CONF 的 TG_CHAT"
+    # 从任意类型的更新里抓 chat（不只 .message，也含 callback / 成员变更 / 频道帖等）
+    pick='.result[]? | (.message // .edited_message // .channel_post // .edited_channel_post // .my_chat_member // .chat_member // .callback_query.message) | select(. != null) | .chat | "  chat_id=\(.id)   \(.first_name // .title // .username // "?")  [\(.type)]"'
+    echo "① 队列里现有的会话（只读，不消费）："
+    FOUND="$(curl -s "$API/getUpdates" | "$JQ" -r "$pick" 2>/dev/null | sort -u)"
+    if [ -n "$FOUND" ]; then
+      printf '%s\n' "$FOUND"
+      echo "→ 把上面的 chat_id 填进 $CONF 的 TG_CHAT 即可。"
+      exit 0
+    fi
+    echo "  （空——可能已被确认消费，或还没发到本 bot）"
+    echo "② 现在去 Telegram 给你的 bot 发条消息（如 hi），实时等待中（最多 ~90 秒）…"
+    # 基线：当前最大 update_id。长轮询必须用「正数 offset」(BASE+1) 才会真正阻塞等待；
+    # offset=-1 只是取队列尾的瞬时快照、会立刻返回——这正是之前 5 次轮询几秒就秒退的原因。
+    BASE="$(curl -s "$API/getUpdates?offset=-1&limit=1" | "$JQ" -r '.result[-1].update_id // 0' 2>/dev/null)"
+    case "$BASE" in ''|*[!0-9]*) BASE=0 ;; esac
+    OFF=$((BASE + 1))
+    # 按「墙钟截止」而非「轮次」循环：即使收到一串非消息更新(如反复点按钮的 callback)，
+    # 也不会几轮瞬间烧完——只要没到 90s 截止就继续等真正的消息。
+    DEADLINE=$(( $(date +%s) + 90 ))
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+      R="$(curl -s --max-time 25 "$API/getUpdates?offset=$OFF&timeout=20")"
+      if [ "$(printf '%s' "$R" | "$JQ" -r '.ok' 2>/dev/null)" = "false" ]; then
+        echo "⚠ Telegram 拒绝拉取：$(printf '%s' "$R" | "$JQ" -r '.description' 2>/dev/null)"
+        echo "  → 同一 bot 同时只能有一个 getUpdates。多半是某个 Claude Code 会话的 niumabar-approve 在等审批，或别处在跑 watch/chatid——停掉它再试。"
+        exit 1
+      fi
+      LAST="$(printf '%s' "$R" | "$JQ" -r '.result[-1].update_id // empty' 2>/dev/null)"
+      [ -n "$LAST" ] && OFF=$((LAST + 1))   # 推进 offset，跳过非消息更新，避免重复返回
+      LINE="$(printf '%s' "$R" | "$JQ" -r "$pick" 2>/dev/null | sort -u)"
+      if [ -n "$LINE" ]; then
+        echo; echo "✅ 抓到了："; printf '%s\n' "$LINE"
+        echo "→ 把 chat_id 填进 $CONF 的 TG_CHAT。"
+        exit 0
+      fi
+      # 收到了更新但没匹配到会话——把类型打出来，别再含糊“没收到”
+      N="$(printf '%s' "$R" | "$JQ" -r '.result | length' 2>/dev/null)"
+      if [ "${N:-0}" -gt 0 ] 2>/dev/null; then
+        T="$(printf '%s' "$R" | "$JQ" -r '[.result[] | (keys_unsorted - ["update_id"])[0]] | join(",")' 2>/dev/null)"
+        echo "  …收到 $N 条非消息更新（$T），已跳过，继续等真正的消息…"
+      else
+        echo "  …等待中（还没收到任何消息）…"
+      fi
+    done
+    WH="$(curl -s "$API/getWebhookInfo" | "$JQ" -r '.result.url // ""' 2>/dev/null)"
+    [ -n "$WH" ] && echo "⚠ 检测到 webhook（$WH）→ getUpdates 会一直为空，需先删除它再试。"
+    echo "× ~90 秒内没收到。请确认：对象就是本 bot、已点过 Start、且未设 webhook。"
     ;;
   test)
     need_token
@@ -37,8 +80,8 @@ case "${1:-}" in
       printf '%s' "$R" | "$JQ" -c '.result[]?' 2>/dev/null | while IFS= read -r u; do
         echo "$u" | "$JQ" -r '"update \(.update_id): callback=\(.callback_query.data // "—")"'
       done
-      OFF="$(printf '%s' "$R" | "$JQ" -r '(.result[-1].update_id // (.0)) ' 2>/dev/null)"
-      [ -n "$OFF" ] && [ "$OFF" != "null" ] && OFF=$((OFF + 1)) || OFF=0
+      L="$(printf '%s' "$R" | "$JQ" -r '.result[-1].update_id // empty' 2>/dev/null)"
+      [ -n "$L" ] && OFF=$((L + 1))   # 只在收到更新时推进 offset；空轮询保持原位继续长轮询
     done
     ;;
   *)
