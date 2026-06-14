@@ -1,0 +1,90 @@
+#!/bin/bash
+# niumabar-hook <source> <mode>
+#   source: claude | codex | 任意标识
+#   mode:   working | post | notify | approval | stop | end
+# 从 stdin 读取 Claude Code / Codex 的 hook JSON，
+# 把会话状态写到 ~/.niumabar/state/<source>-<session>.json 给小牛马看。
+# 同时从 transcript 估算「当前上下文 token 占用」当作小牛马的精力消耗（仅 Claude 格式）。
+# 永远 exit 0，绝不阻塞 agent。
+
+SRC="${1:-claude}"
+MODE="${2:-working}"
+DIR="$HOME/.niumabar/state"
+mkdir -p "$DIR" 2>/dev/null
+[ -r "$HOME/.niumabar/telegram.conf" ] && . "$HOME/.niumabar/telegram.conf" 2>/dev/null
+
+JQ="$(command -v jq || echo /usr/bin/jq)"
+IN="$(cat 2>/dev/null || true)"
+
+SID="$(printf '%s' "$IN" | "$JQ" -r '.session_id // empty' 2>/dev/null)"
+[ -n "$SID" ] || SID="unknown"
+KEY="$SRC-$SID"
+OLD="$("$JQ" -r '.state // ""' "$DIR/$KEY.json" 2>/dev/null)"
+
+STATE=""
+case "$MODE" in
+  working)  STATE="working" ;;
+  approval) STATE="approval" ;;
+  stop)     STATE="idle" ;;
+  end)      rm -f "$DIR/$KEY.json" 2>/dev/null; exit 0 ;;
+  post)
+    ERR="$(printf '%s' "$IN" | "$JQ" -r 'try ((.tool_response.success == false) or (.tool_response.is_error == true) or (.tool_response.isError == true)) catch false' 2>/dev/null)"
+    if [ "$ERR" = "true" ]; then STATE="failed"; else STATE="working"; fi
+    ;;
+  notify)
+    MSG="$(printf '%s' "$IN" | "$JQ" -r '.message // empty' 2>/dev/null)"
+    case "$MSG" in
+      *ermission*|*pprov*)  STATE="approval" ;;
+      *waiting*)            STATE="idle" ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+
+# 精力 = 整个会话的累计 token 消耗（所有 assistant message 的 input+output+cache_creation 之和）。
+# 累加整个 transcript（单调递增，反映真实消耗）；只解析 Claude 格式。
+# Codex transcript 格式不同，暂不接入（tokens=0 → 满精力）。
+TOK=0
+TP="$(printf '%s' "$IN" | "$JQ" -r '.transcript_path // empty' 2>/dev/null)"
+if [ "$SRC" = "claude" ] && [ -n "$TP" ] && [ -f "$TP" ]; then
+  T="$(python3 -c '
+import json, sys
+tot = 0
+try:
+    for line in open(sys.argv[1], errors="ignore"):
+        try:
+            u = (json.loads(line).get("message") or {}).get("usage")
+            if u: tot += u.get("input_tokens", 0) + u.get("output_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+        except Exception: pass
+except Exception: pass
+print(tot)
+' "$TP" 2>/dev/null)"
+  case "$T" in (''|*[!0-9]*) T=0 ;; esac
+  TOK="$T"
+fi
+
+TMP="$(mktemp "$DIR/.tmp.XXXXXX" 2>/dev/null)" || exit 0
+printf '{"state":"%s","ts":%s,"source":"%s","session":"%s","tokens":%s}\n' \
+  "$STATE" "$(date +%s)" "$SRC" "$SID" "$TOK" > "$TMP" 2>/dev/null
+mv -f "$TMP" "$DIR/$KEY.json" 2>/dev/null
+
+# 失败/完成 推送 Telegram（纯通知无按钮；仅状态「转变进入」时推一次）
+if [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ]; then
+  SHORT="$(printf '%s' "$SID" | head -c 8)"
+  TGAPI="https://api.telegram.org/bot$TG_TOKEN/sendMessage"
+  case "$STATE" in
+    failed)
+      if [ "$OLD" != "failed" ] && [ "${NOTIFY_FAILED:-1}" != "0" ]; then
+        curl -sS --max-time 5 "$TGAPI" --data-urlencode "chat_id=$TG_CHAT" \
+          --data-urlencode "text=❌ 任务失败  ·  会话 $SHORT" >/dev/null 2>&1
+      fi ;;
+    idle)
+      case "$OLD" in
+        working|approval)
+          [ "${NOTIFY_DONE:-1}" != "0" ] && curl -sS --max-time 5 "$TGAPI" \
+            --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=✅ 任务完成  ·  会话 $SHORT" >/dev/null 2>&1 ;;
+      esac ;;
+  esac
+fi
+exit 0

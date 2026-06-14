@@ -1,0 +1,20 @@
+# NiuMaBar Telegram 远程审批配置
+# 复制到 ~/.niumabar/telegram.conf 并填好，然后 chmod 600。
+
+# 1) 在 Telegram 找 @BotFather，/newbot 创建一个 bot，把它给你的 token 填这里
+TG_TOKEN=""
+
+# 2) 给你的新 bot 发一条任意消息，然后运行：~/.niumabar/bin/niumabar-tg chatid
+#    把显示的 chat_id 填这里
+TG_CHAT=""
+
+# 哪些工具触发远程审批（空格分隔）。默认只对会改动系统的敏感工具。
+APPROVE_TOOLS="Bash Edit Write MultiEdit NotebookEdit"
+
+# 等待远程决定的秒数；超时则回落到本地终端审批（不会自动放行）。
+# 注意：settings.json 里该 hook 的 timeout 必须 ≥ 这个值。
+APPROVE_TIMEOUT=250
+
+# 失败/完成 推送通知（纯通知，无按钮）。0=关闭。
+NOTIFY_FAILED=1
+NOTIFY_DONE=1

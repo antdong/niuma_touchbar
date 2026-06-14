@@ -1,0 +1,48 @@
+#!/bin/bash
+# Telegram 远程审批的配置助手
+#   niumabar-tg chatid   列出最近给 bot 发过消息的 chat id（填进 telegram.conf）
+#   niumabar-tg test     发一条带按钮的测试消息，确认 token/chat 正确
+#   niumabar-tg watch    实时打印你点的按钮回调（调试用）
+CONF="$HOME/.niumabar/telegram.conf"
+[ -r "$CONF" ] && . "$CONF" 2>/dev/null
+JQ="$(command -v jq || echo /usr/bin/jq)"
+API="https://api.telegram.org/bot$TG_TOKEN"
+
+need_token() { [ -n "$TG_TOKEN" ] || { echo "× 先在 $CONF 填 TG_TOKEN（@BotFather 建 bot 得到）"; exit 1; }; }
+
+case "${1:-}" in
+  chatid)
+    need_token
+    echo "最近给该 bot 发过消息的会话："
+    curl -s "$API/getUpdates" | "$JQ" -r '.result[]?.message.chat | "  chat_id=\(.id)   \(.first_name // .title // "?")"' | sort -u
+    echo "→ 先在 Telegram 给你的 bot 发任意一条消息，再跑本命令；把 chat_id 填进 $CONF 的 TG_CHAT"
+    ;;
+  test)
+    need_token
+    [ -n "$TG_CHAT" ] || { echo "× 先填 TG_CHAT（用 niumabar-tg chatid 获取）"; exit 1; }
+    OK="$(curl -s "$API/sendMessage" \
+      --data-urlencode "chat_id=$TG_CHAT" \
+      --data-urlencode "text=🐴 NiuMaBar 远程审批连通测试" \
+      --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"✅ 批准","callback_data":"atest"},{"text":"❌ 拒绝","callback_data":"dtest"}]]}' \
+      | "$JQ" -r '.ok')"
+    [ "$OK" = "true" ] && echo "✓ 已发送，去手机 Telegram 看是否收到带两个按钮的消息" \
+                       || echo "× 发送失败，检查 TG_TOKEN / TG_CHAT"
+    ;;
+  watch)
+    need_token
+    echo "监听按钮点击（Ctrl-C 退出）…"
+    OFF=0
+    while true; do
+      R="$(curl -s "$API/getUpdates?timeout=20&offset=$OFF")"
+      printf '%s' "$R" | "$JQ" -c '.result[]?' 2>/dev/null | while IFS= read -r u; do
+        echo "$u" | "$JQ" -r '"update \(.update_id): callback=\(.callback_query.data // "—")"'
+      done
+      OFF="$(printf '%s' "$R" | "$JQ" -r '(.result[-1].update_id // (.0)) ' 2>/dev/null)"
+      [ -n "$OFF" ] && [ "$OFF" != "null" ] && OFF=$((OFF + 1)) || OFF=0
+    done
+    ;;
+  *)
+    echo "用法: niumabar-tg chatid | test | watch"
+    echo "配置文件: ${CONF}  (TG_TOKEN, TG_CHAT, APPROVE_TOOLS, APPROVE_TIMEOUT)"
+    ;;
+esac

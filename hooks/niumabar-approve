@@ -1,0 +1,101 @@
+#!/bin/bash
+# PreToolUse hook：敏感工具 → Telegram 远程审批（健壮版）
+# 关键：串行锁保证一次只一个 approve 在轮询；用 message_id 精确匹配自己那条审批消息的按钮，
+#       baseline offset 只看推送之后的更新——彻底避免多审批并发时决定串号。
+#   远程批准 → permissionDecision=allow；拒绝 → deny；永久允许 → allow + 记入白名单
+#   超时/未配置/不可达 → 不输出 → 回落本地审批（绝不误阻断）。纯出站，永远 exit 0。
+
+CONF="$HOME/.niumabar/telegram.conf"
+[ -r "$CONF" ] && . "$CONF" 2>/dev/null
+
+JQ="$(command -v jq || echo /usr/bin/jq)"
+IN="$(cat 2>/dev/null)"
+TOOL="$(printf '%s' "$IN" | "$JQ" -r '.tool_name // ""' 2>/dev/null)"
+
+APPROVE_TOOLS="${APPROVE_TOOLS:-Bash Edit Write MultiEdit NotebookEdit}"
+case " $APPROVE_TOOLS " in *" $TOOL "*) ;; *) exit 0 ;; esac
+[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
+
+API="https://api.telegram.org/bot$TG_TOKEN"
+TIMEOUT="${APPROVE_TIMEOUT:-250}"
+DESC="$(printf '%s' "$IN" | "$JQ" -r '.tool_input.command // .tool_input.file_path // (.tool_input|tostring)' 2>/dev/null | head -c 400)"
+SID="$(printf '%s' "$IN" | "$JQ" -r '.session_id // "?"' 2>/dev/null)"
+SHORT="$(printf '%s' "$SID" | head -c 8)"
+
+# 永久允许列表：精确命中则直接放行，不推送
+ALLOWLIST="$HOME/.niumabar/approve-allow.list"
+KEY="$(printf '%s\t%s' "$TOOL" "$DESC")"
+if [ -f "$ALLOWLIST" ] && grep -Fxq "$KEY" "$ALLOWLIST" 2>/dev/null; then
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"已在永久允许列表"}}\n'
+  exit 0
+fi
+
+# 小牛马变黄（审批态）
+mkdir -p "$HOME/.niumabar/state" 2>/dev/null
+printf '{"state":"approval","ts":%s,"source":"claude","session":"%s"}' "$(date +%s)" "$SID" \
+  > "$HOME/.niumabar/state/claude-$SID.json" 2>/dev/null
+
+# 串行锁：一次只一个 approve 推送+轮询（避免并发 getUpdates 竞争）
+LOCK="$HOME/.niumabar/tg-approve.lock"
+LOCKED=0
+LW=$(( $(date +%s) + TIMEOUT ))
+while [ "$(date +%s)" -lt "$LW" ]; do
+  if mkdir "$LOCK" 2>/dev/null; then LOCKED=1; break; fi
+  if [ -d "$LOCK" ]; then
+    AGE=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || echo 0) ))
+    [ "$AGE" -gt $((TIMEOUT + 40)) ] && rmdir "$LOCK" 2>/dev/null
+  fi
+  sleep 1
+done
+[ "$LOCKED" = 1 ] || exit 0
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+# baseline：推送前记下当前最大 update_id，只看之后的（忽略历史残留 callback）
+BASE="$(curl -s --max-time 15 "$API/getUpdates?offset=-1&limit=1" | "$JQ" -r '.result[-1].update_id // 0' 2>/dev/null)"
+case "$BASE" in ''|*[!0-9]*) BASE=0 ;; esac
+OFF=$((BASE + 1))
+
+# 推送，拿到这条消息的 message_id（用于精确匹配按钮回调）
+KB='{"inline_keyboard":[[{"text":"✅ 批准","callback_data":"a"},{"text":"❌ 拒绝","callback_data":"d"}],[{"text":"♾️ 永久允许此命令","callback_data":"p"}]]}'
+MSG="🐴 审批请求  [$TOOL]  会话 $SHORT
+────────────
+$DESC"
+SR="$(curl -sS --max-time 15 "$API/sendMessage" \
+  --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$MSG" --data-urlencode "reply_markup=$KB" 2>/dev/null)"
+MID="$(printf '%s' "$SR" | "$JQ" -r '.result.message_id // empty' 2>/dev/null)"
+
+# 轮询：只认 message_id == 自己 MID 的按钮回调
+DECISION=""
+DEADLINE=$(( $(date +%s) + TIMEOUT ))
+while [ -z "$DECISION" ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  UPS="$(curl -s --max-time 15 "$API/getUpdates?offset=$OFF&timeout=10" 2>/dev/null)"
+  N="$(printf '%s' "$UPS" | "$JQ" '.result | length' 2>/dev/null)"
+  case "$N" in ''|*[!0-9]*) N=0 ;; esac
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    U="$(printf '%s' "$UPS" | "$JQ" -c ".result[$i]" 2>/dev/null)"
+    i=$((i + 1))
+    UPD="$(printf '%s' "$U" | "$JQ" -r '.update_id // empty' 2>/dev/null)"
+    [ -n "$UPD" ] && OFF=$((UPD + 1))
+    CBID="$(printf '%s' "$U" | "$JQ" -r '.callback_query.id // empty' 2>/dev/null)"
+    [ -n "$CBID" ] && curl -s --max-time 10 "$API/answerCallbackQuery" \
+      -d "callback_query_id=$CBID" --data-urlencode "text=已收到" >/dev/null 2>&1
+    CBMID="$(printf '%s' "$U" | "$JQ" -r '.callback_query.message.message_id // empty' 2>/dev/null)"
+    [ -n "$MID" ] && [ "$CBMID" = "$MID" ] || continue
+    case "$(printf '%s' "$U" | "$JQ" -r '.callback_query.data // empty' 2>/dev/null)" in
+      a) DECISION=allow ;;
+      d) DECISION=deny ;;
+      p) DECISION=permanent ;;
+    esac
+  done
+done
+
+case "$DECISION" in
+  allow) printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Telegram 远程批准"}}\n' ;;
+  deny)  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Telegram 远程拒绝"}}\n' ;;
+  permanent)
+    printf '%s\n' "$KEY" >> "$ALLOWLIST"
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"远程永久允许（已加入白名单）"}}\n' ;;
+  *) ;;  # 超时无决定 → 回落本地审批
+esac
+exit 0
